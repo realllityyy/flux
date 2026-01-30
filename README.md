@@ -17,10 +17,8 @@ Flux is a **lightweight, high-performance networking module** for Roblox. It pro
 - [Usage Examples](#usage-examples)
   - [Server Example](#server-example)
   - [Client Example](#client-example)
-  - [Fast Local Event Example](#fast-local-event-example)
 - [Notes](#notes)
 - [Updates](#updates)
-- [License](#license)
 
 ---
 
