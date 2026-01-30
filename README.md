@@ -1,8 +1,8 @@
 # Flux - Minimalist Network Event System for Roblox
 
-[![Version](https://img.shields.io/badge/version-1.0-blue.svg)](https://github.com/yourusername/Flux)
+[![Version](https://img.shields.io/badge/version-1.0-blue.svg)](https://github.com/realllityyy/Flux)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Roblox](https://img.shields.io/badge/platform-Roblox-red.svg)](https://www.roblox.com/)
+[![Roblox](https://img.shields.io/badge/platform-Roblox-red.svg)](https://create.roblox.com/store/asset/71059602594151)
 
 Flux is a **lightweight, high-performance networking module** for Roblox. It provides **safe and efficient communication** between server and clients, with **built-in anti-spam protections** and **optional local-only events**.
 
