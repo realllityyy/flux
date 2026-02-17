@@ -397,59 +397,65 @@ end
 
 -- BATCHER (HOT PATH: efficient message accumulation)
 
+type SharedPayload = {
+    payload: buffer,
+    backing: buffer,
+    size: number,
+    refs: number,
+}
+
 type BatchData = {
-    payloads: { buffer },
-    buffers: { buffer },
-    sizes: { number },
+    payloads: { SharedPayload },
     count: number,
 }
 
 -- Create batcher for accumulating and flushing messages
 local function createBatcher(remote: RemoteEvent, stats: Stats)
-    local broadcastPayloads: { buffer } = table.create(16)
-    local broadcastBuffers: { buffer } = table.create(16)
-    local broadcastSizes: { number } = table.create(16)
+    local broadcastPayloads: { SharedPayload } = table.create(16)
     local broadcastCount = 0
 
     local playerBatches: { [Player]: BatchData } = {}
     local flushScheduled = false
 
+    local function releaseSharedPayload(shared: SharedPayload)
+        shared.refs -= 1
+        if shared.refs == 0 then
+            releaseBuffer(shared.backing)
+        end
+    end
+
     -- HOT PATH: Flush batched messages
     local function flush()
         flushScheduled = false
+        local needsAnotherFlush = false
 
         if broadcastCount > 0 then
             local chunk = math.min(broadcastCount, MAX_BATCH_SIZE)
 
             for i = 1, chunk do
-                local ok = pcall(remote.FireAllClients, remote, broadcastPayloads[i])
+                local shared = broadcastPayloads[i]
+                local ok = pcall(remote.FireAllClients, remote, shared.payload)
                 if ok then
-                    stats.bytesSent += broadcastSizes[i]
+                    stats.bytesSent += shared.size
                     stats.messagesSent += 1
                 else
                     stats.messagesDropped += 1
                 end
-                releaseBuffer(broadcastBuffers[i])
+                releaseSharedPayload(shared)
             end
 
             if broadcastCount > chunk then
                 for i = 1, broadcastCount - chunk do
                     broadcastPayloads[i] = broadcastPayloads[chunk + i]
-                    broadcastBuffers[i] = broadcastBuffers[chunk + i]
-                    broadcastSizes[i] = broadcastSizes[chunk + i]
                 end
                 for i = broadcastCount - chunk + 1, broadcastCount do
                     broadcastPayloads[i] = nil
-                    broadcastBuffers[i] = nil
-                    broadcastSizes[i] = nil
                 end
                 broadcastCount -= chunk
-                task.defer(flush)
+                needsAnotherFlush = true
             else
                 for i = 1, broadcastCount do
                     broadcastPayloads[i] = nil
-                    broadcastBuffers[i] = nil
-                    broadcastSizes[i] = nil
                 end
                 broadcastCount = 0
             end
@@ -459,48 +465,47 @@ local function createBatcher(remote: RemoteEvent, stats: Stats)
             local chunk = math.min(batch.count, MAX_BATCH_SIZE)
 
             for i = 1, chunk do
-                local ok = pcall(remote.FireClient, remote, player, batch.payloads[i])
+                local shared = batch.payloads[i]
+                local ok = pcall(remote.FireClient, remote, player, shared.payload)
                 if ok then
-                    stats.bytesSent += batch.sizes[i]
+                    stats.bytesSent += shared.size
                     stats.messagesSent += 1
                 else
                     stats.messagesDropped += 1
                 end
-                releaseBuffer(batch.buffers[i])
+                releaseSharedPayload(shared)
             end
 
             if batch.count > chunk then
                 for i = 1, batch.count - chunk do
                     batch.payloads[i] = batch.payloads[chunk + i]
-                    batch.buffers[i] = batch.buffers[chunk + i]
-                    batch.sizes[i] = batch.sizes[chunk + i]
                 end
                 for i = batch.count - chunk + 1, batch.count do
                     batch.payloads[i] = nil
-                    batch.buffers[i] = nil
-                    batch.sizes[i] = nil
                 end
                 batch.count -= chunk
+                needsAnotherFlush = true
             else
                 playerBatches[player] = nil
             end
         end
+
+        if needsAnotherFlush then
+            flushScheduled = true
+            task.defer(flush)
+        end
     end
 
     -- HOT PATH: Queue message for batched sending
-    return function(targetType: number, targetPlayer: Player?, payload: buffer, buf: buffer, size: number)
+    return function(targetType: number, targetPlayer: Player?, payload: SharedPayload)
         if targetType == TARGET_ALL then
             broadcastCount += 1
             broadcastPayloads[broadcastCount] = payload
-            broadcastBuffers[broadcastCount] = buf
-            broadcastSizes[broadcastCount] = size
         elseif targetType == TARGET_PLAYER and targetPlayer then
             local batch = playerBatches[targetPlayer]
             if not batch then
                 batch = {
                     payloads = table.create(8),
-                    buffers = table.create(8),
-                    sizes = table.create(8),
                     count = 0,
                 }
                 playerBatches[targetPlayer] = batch
@@ -508,8 +513,6 @@ local function createBatcher(remote: RemoteEvent, stats: Stats)
 
             batch.count += 1
             batch.payloads[batch.count] = payload
-            batch.buffers[batch.count] = buf
-            batch.sizes[batch.count] = size
         end
 
         if not flushScheduled then
@@ -789,7 +792,12 @@ function Flux.new(name: string, options: { fast: number? }?): Event
         signal:Fire(...)
         if isServer and activePlayerCount > 0 and remote then
             local payload, buf, size = Serializer.encode(...)
-            batcher(TARGET_ALL, nil, payload, buf, size)
+            batcher(TARGET_ALL, nil, {
+                payload = payload,
+                backing = buf,
+                size = size,
+                refs = 1,
+            })
         end
     end
 
@@ -803,11 +811,31 @@ function Flux.new(name: string, options: { fast: number? }?): Event
         FireSome = function(_, players: { Player }, ...)
             signal:Fire(...)
             if remote and #players > 0 then
-                local payload, buf, size = Serializer.encode(...)
-                for _, player in players do
+                local validPlayers: { Player } = table.create(#players)
+                local validCount = 0
+
+                for i = 1, #players do
+                    local player = players[i]
                     if activePlayers[player] then
-                        batcher(TARGET_PLAYER, player, payload, buf, size)
+                        validCount += 1
+                        validPlayers[validCount] = player
                     end
+                end
+
+                if validCount == 0 then
+                    return
+                end
+
+                local payload, buf, size = Serializer.encode(...)
+                local sharedPayload = {
+                    payload = payload,
+                    backing = buf,
+                    size = size,
+                    refs = validCount,
+                }
+
+                for i = 1, validCount do
+                    batcher(TARGET_PLAYER, validPlayers[i], sharedPayload)
                 end
             end
         end,
